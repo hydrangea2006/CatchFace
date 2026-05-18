@@ -5,39 +5,36 @@ import AvatarModel from './components/AvatarModel';
 import FaceDriver from './components/FaceDriver';
 import * as THREE from 'three';
 
-function App() {
-  // 存储从 AvatarModel 获得的头部 Mesh，初始为 null
+export default function App() {
+  // 头部网络
   const [headMesh, setHeadMesh] = useState<THREE.Mesh | null>(null);
-  
-  // 组件每次刷新时都使用这同一函数,而不是创建一个新的函数
-  // 用 useCallback 包裹回调，避免不必要的重渲染
+
+  // 缓存回调，AvatarModel耗能大，需要避免其因 props 变化而重新加载
   const handleHeadMeshReady = useCallback((mesh: THREE.Mesh) => {
     setHeadMesh(mesh);
   }, []);
 
   return (
-    // Canvas 组件会创建一个 Three.js 渲染器，并自动处理 resize
     <Canvas
       camera={{ position: [0, 1.5, 2.5], fov: 45 }}
       style={{ width: '100vw', height: '100vh', background: '#1a1a1a' }}
     >
-      {/* 环境光：柔和照亮模型 */}
+      {/* 环境光 */}
       <ambientLight intensity={0.7} />
-      {/* 平行光：模拟主光源，产生立体感 */}
-      <directionalLight position={[1, 2, 3]} intensity={1.0} />
 
-      {/* 加载 Ready Player Me 模型，并接收头部 Mesh */}
-      <AvatarModel url="/models/avatar.glb" onHeadMeshReady={handleHeadMeshReady} />
+      {/* 平行光 */}
+      <directionalLight position={[1, 2, 3]} intensity={1.0} /> 
 
-      {/* 只有当头部 Mesh 存在时才挂载驱动组件，避免无效操作 */}
+      {/* 加载并3D角色 */}
+      <AvatarModel url='/models/avatar.glb' onHeadMeshReady={handleHeadMeshReady} />
+
+      {/* 有头部网格才能连接面部数据，serverUrl为python后端地址 */}
       {headMesh && (
-        <FaceDriver serverUrl="http://localhost:5000" headMesh={headMesh} />
+        <FaceDriver serverUrl='http://localhost:5000' headMesh={headMesh} />
       )}
 
-      {/* 轨道控制器：允许用户用鼠标旋转、缩放视角（调试用） */}
+      {/* 鼠标拖拽旋转视角 */}
       <OrbitControls target={[0, 1.5, 0]} />
     </Canvas>
   );
 }
-
-export default App;
