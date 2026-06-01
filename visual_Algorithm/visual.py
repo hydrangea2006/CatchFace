@@ -3,63 +3,95 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import time
+from oefilter import oefilter  # 导入你写的一欧元滤波器模块
 
 class FaceCatcher:
     def __init__(self):
-        self.done_frame = None
+        # 1. 配置 MediaPipe 的人工智能模型参数
         base_options = python.BaseOptions(model_asset_path="face_landmarker_v2_with_blendshapes.task")
         self.options = vision.FaceLandmarkerOptions(
             base_options = base_options,
-            output_face_blendshapes = True,
-            output_facial_transformation_matrixes = True,
-            running_mode = vision.RunningMode.LIVE_STREAM,  
-            result_callback = self.result_callback,
+            output_face_blendshapes = False,
+            output_facial_transformation_matrixes = False,
+            running_mode = vision.RunningMode.LIVE_STREAM,  # 开启异步直播流模式
+            result_callback = self.result_callback,         # 指定计算完后的“交货”回调函数
             num_faces = 1
         )
+        
+        # 2. 实例化一个一欧元滤波器，用来专门给鼻尖（4号点）去噪防抖
+        self.filter = oefilter(mincutoff=1.0, beta=0.007, dcutoff=1.0)
+        
+        # 3. 初始化时间戳，用来记录“上一帧”的时间
+        self.last_time = None
 
     def start_stream(self):
+        # 创建面部关键点检测器
         self.face_landmarker = vision.FaceLandmarker.create_from_options(self.options)
+        # 打开电脑的默认摄像头（0代表第一个摄像头）
         self.cap = cv2.VideoCapture(0)
         
-        while self.cap.isOpened():
-            success, image = self.cap.read()
-            if not success:
-                print("unable to get image from camera")
-                continue
-                
-            rbg_img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rbg_img)
-            
-            timestamp = int(time.time() * 1000)
-            self.face_landmarker.detect_async(mp_image, timestamp)
-            
-            if self.done_frame is not None:
-                cv2.imshow("test", self.done_frame)
-            else:
-                cv2.imshow("test", image)
-                
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-                
-        self.cap.release()
-        cv2.destroyAllWindows()
-
-    def result_callback(self, result, output_image, s_timestamp):
-        rbg_frame = output_image.numpy_view()
-        annotated_frame = rbg_frame.copy()
-        
-        h, w, _ = annotated_frame.shape
-        
-        
-        if result.face_landmarks:
-            for face_landmarks in result.face_landmarks:
-                for landmark in face_landmarks:
-                    cx, cy = int(landmark.x * w), int(landmark.y * h)
+        print("【提示】后台检测已启动！请在控制台按下 Ctrl + C 来停止程序。")
+    
+        try:
+            while self.cap.isOpened():
+                success, image = self.cap.read()
+                if not success:
+                    print("无法从摄像头获取画面...")
+                    continue
                     
-
-                    cv2.circle(annotated_frame, (cx, cy), 1, (0, 255, 200), -1)
+                # MediaPipe 需要 RGB 格式，而 OpenCV 默认读出的是 BGR 格式，所以需要转换
+                rbg_img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                # 将转换后的图像包装成 MediaPipe 专属的 Image 对象
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rbg_img)
                 
-        self.done_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
+                # 获取当前精确的毫秒级时间戳（MediaPipe 异步流要求必须提供递增的时间戳）
+                timestamp = int(time.time() * 1000)
+                
+                # 【核心动作】把图像异步扔给 AI 模型去检测，AI 算完后会自动调用 result_callback
+                self.face_landmarker.detect_async(mp_image, timestamp)
+                
+                # 稍微让 CPU 歇 10 毫秒，防止 while 死循环把电脑处理器跑满
+                time.sleep(0.01)
+                
+        except KeyboardInterrupt:
+            print("\n正在接收退出指令...")
+        finally:
+            # 无论如何，最后都要释放摄像头并关闭 AI 实例，否则后台线程会卡死
+            self.cap.release()
+            self.face_landmarker.close()
+            print("程序已安全关闭。")
+
+    # 核心数据处理工厂（回调函数）：只要 AI 识别出一帧结果，就会自动进到这里
+    def result_callback(self, result, output_image, s_timestamp):
+        # 安全检查：如果画面里没有人脸，result 里面没东西，就直接返回，防止程序崩溃
+        if not result or not result.face_landmarks:
+            return
+            
+        # 1. 拿到检测到的第一张脸的 478 个原始关键点
+        raw_face_points = result.face_landmarks[0]
+        
+        # 2. 抽出第 4 号点（鼻尖点）
+        raw_nose = raw_face_points[4]
+        rx, ry, rz = raw_nose.x, raw_nose.y, raw_nose.z # 拿到带有高频抖动的原始 3D 坐标
+        
+        # 3. 计算这一帧和上一帧之间，究竟过去了多少秒（也就是 te）
+        current_time = time.time()
+        if self.last_time is None:
+            self.last_time = current_time
+            return  # 第一帧作为时间基准，先跳过不计算
+    
+        te = current_time - self.last_time  # 两帧之间的时间差（单位：秒）
+        self.last_time = current_time       # 把当前时间存下来，留给下一帧用
+        
+        if te <= 0: 
+            te = 0.01  
+
+        cx, cy, cz = self.filter(rx, ry, rz, te)  # 产出洗干净后的无抖动 3D 坐标
+        
+        # 4. 打印出来让你肉眼对比洗前和洗后的差别
+        print("-" * 50)
+        print(f"【原始坐标】X: {rx:.4f}, Y: {ry:.4f}, Z: {rz:.4f}")
+        print(f"【洗干净后】X: {cx:.4f}, Y: {cy:.4f}, Z: {cz:.4f}")
 
 if __name__ == "__main__":
     catcher = FaceCatcher()
