@@ -3,8 +3,7 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import time
-from oefilter import oefilter  # 导入你写的一欧元滤波器模块
-
+from ldtransformer import land_mark_transformer
 class FaceCatcher:
     def __init__(self):
         # 1. 配置 MediaPipe 的人工智能模型参数
@@ -13,16 +12,15 @@ class FaceCatcher:
             base_options = base_options,
             output_face_blendshapes = False,
             output_facial_transformation_matrixes = False,
+            refine_face_landmarks = True,
             running_mode = vision.RunningMode.LIVE_STREAM,  # 开启异步直播流模式
             result_callback = self.result_callback,         # 指定计算完后的“交货”回调函数
             num_faces = 1
         )
         
         # 2. 实例化一个一欧元滤波器，用来专门给鼻尖（4号点）去噪防抖
-        self.filter = oefilter(mincutoff=1.0, beta=0.007, dcutoff=1.0)
         
-        # 3. 初始化时间戳，用来记录“上一帧”的时间
-        self.last_time = None
+        
 
     def start_stream(self):
         # 创建面部关键点检测器
@@ -30,7 +28,6 @@ class FaceCatcher:
         # 打开电脑的默认摄像头（0代表第一个摄像头）
         self.cap = cv2.VideoCapture(0)
         
-        print("【提示】后台检测已启动！请在控制台按下 Ctrl + C 来停止程序。")
     
         try:
             while self.cap.isOpened():
@@ -70,29 +67,6 @@ class FaceCatcher:
         # 1. 拿到检测到的第一张脸的 478 个原始关键点
         raw_face_points = result.face_landmarks[0]
         
-        # 2. 抽出第 4 号点（鼻尖点）
-        raw_nose = raw_face_points[4]
-        rx, ry, rz = raw_nose.x, raw_nose.y, raw_nose.z # 拿到带有高频抖动的原始 3D 坐标
-        
-        # 3. 计算这一帧和上一帧之间，究竟过去了多少秒（也就是 te）
-        current_time = time.time()
-        if self.last_time is None:
-            self.last_time = current_time
-            return  # 第一帧作为时间基准，先跳过不计算
-    
-        te = current_time - self.last_time  # 两帧之间的时间差（单位：秒）
-        self.last_time = current_time       # 把当前时间存下来，留给下一帧用
-        
-        if te <= 0: 
-            te = 0.01  
-
-        cx, cy, cz = self.filter(rx, ry, rz, te)  # 产出洗干净后的无抖动 3D 坐标
-        
-        # 4. 打印出来让你肉眼对比洗前和洗后的差别
-        print("-" * 50)
-        print(f"【原始坐标】X: {rx:.4f}, Y: {ry:.4f}, Z: {rz:.4f}")
-        print(f"【洗干净后】X: {cx:.4f}, Y: {cy:.4f}, Z: {cz:.4f}")
-
 if __name__ == "__main__":
     catcher = FaceCatcher()
     catcher.start_stream()
