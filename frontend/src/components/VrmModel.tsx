@@ -119,16 +119,19 @@ const VrmModel: React.FC<Props> = ({ url, onVrmReady, frameRef }) => {
 
   useEffect(() => {
     if (!vrm) return;
-
+    
     console.log('[VrmModel] ✅ VRM 加载成功');
+    
+  
 
+    // ── 模型正面朝向相机 ──
+    vrm.scene.rotation.y = Math.PI;
+    
     // ── 方案 A：expressionManager ──
     const em = vrm.expressionManager;
     if (em) {
-      // 兼容不同版本的 VRM SDK：尝试获取已注册的表达式名称
       let names: string[] = [];
       try {
-        // v1.x: expressionsMap 是 Map<string, VRMExpression>
         const exprMap = (em as any).expressionsMap;
         if (exprMap instanceof Map) {
           names = [...exprMap.keys()];
@@ -179,47 +182,45 @@ const VrmModel: React.FC<Props> = ({ url, onVrmReady, frameRef }) => {
         'browInnerUp=' + allMorphNames.has('browInnerUp'),
         'mouthPucker=' + allMorphNames.has('mouthPucker'),
       );
-      // 打印所有 ShapeKey 名，确认 facial1. 前缀
       console.log('[VrmModel] 🎭 全部 ShapeKey 名称:', [...allMorphNames].sort());
-      // 不 return，继续执行下面的手臂下垂逻辑
     } else {
       // ── 方案 C：骨骼驱动 ──
-    console.log('[VrmModel] 🔍 启用骨骼驱动模式');
+      console.log('[VrmModel] 🔍 启用骨骼驱动模式');
 
-    const boneNodeMap = new Map<string, THREE.Object3D>();
-    vrm.scene.traverse((obj) => {
-      if (obj.name) boneNodeMap.set(obj.name, obj);
-    });
+      const boneNodeMap = new Map<string, THREE.Object3D>();
+      vrm.scene.traverse((obj) => {
+        if (obj.name) boneNodeMap.set(obj.name, obj);
+      });
 
-    const faceRelatedNames = [...boneNodeMap.keys()].filter(
-      (n) => /face|jaw|eye|brow|mouth|cheek|nose|head|neck/i.test(n)
-    );
-    console.log('[VrmModel] 🦴 面部相关骨骼节点 (' + faceRelatedNames.length + '个):', faceRelatedNames.sort());
-
-    const drivers = new Map<string, Array<{ node: THREE.Object3D; axis: string; maxAngle: number; defaultValue: number }>>();
-
-    for (const [arkitName, configs] of Object.entries(BONE_EXPRESSION_MAP)) {
-      const matched: Array<{ node: THREE.Object3D; axis: string; maxAngle: number; defaultValue: number }> = [];
-      for (const config of configs) {
-        const node = boneNodeMap.get(config.boneName);
-        if (node) {
-          matched.push({ node, axis: config.axis, maxAngle: config.maxAngle, defaultValue: node.rotation[config.axis] });
-        }
-      }
-      if (matched.length > 0) drivers.set(arkitName, matched);
-    }
-
-    boneDrivers.current = drivers;
-    console.log('[VrmModel] 🎬 骨骼驱动映射 (' + drivers.size + '个表达式):', [...drivers.keys()]);
-
-    if (drivers.size === 0) {
-      console.warn('[VrmModel] ❌ 未能匹配任何面部骨骼！');
-      console.warn('[VrmModel] 查找的骨骼名:',
-        [...new Set(Object.values(BONE_EXPRESSION_MAP).flat().map(c => c.boneName))].sort()
+      const faceRelatedNames = [...boneNodeMap.keys()].filter(
+        (n) => /face|jaw|eye|brow|mouth|cheek|nose|head|neck/i.test(n)
       );
-      console.warn('[VrmModel] 模型节点:', [...boneNodeMap.keys()].sort());
+      console.log('[VrmModel] 🦴 面部相关骨骼节点 (' + faceRelatedNames.length + '个):', faceRelatedNames.sort());
+
+      const drivers = new Map<string, Array<{ node: THREE.Object3D; axis: string; maxAngle: number; defaultValue: number }>>();
+
+      for (const [arkitName, configs] of Object.entries(BONE_EXPRESSION_MAP)) {
+        const matched: Array<{ node: THREE.Object3D; axis: string; maxAngle: number; defaultValue: number }> = [];
+        for (const config of configs) {
+          const node = boneNodeMap.get(config.boneName);
+          if (node) {
+            matched.push({ node, axis: config.axis, maxAngle: config.maxAngle, defaultValue: node.rotation[config.axis] });
+          }
+        }
+        if (matched.length > 0) drivers.set(arkitName, matched);
+      }
+
+      boneDrivers.current = drivers;
+      console.log('[VrmModel] 🎬 骨骼驱动映射 (' + drivers.size + '个表达式):', [...drivers.keys()]);
+
+      if (drivers.size === 0) {
+        console.warn('[VrmModel] ❌ 未能匹配任何面部骨骼！');
+        console.warn('[VrmModel] 查找的骨骼名:',
+          [...new Set(Object.values(BONE_EXPRESSION_MAP).flat().map(c => c.boneName))].sort()
+        );
+        console.warn('[VrmModel] 模型节点:', [...boneNodeMap.keys()].sort());
+      }
     }
-    } // end else (方案 C: 骨骼驱动)
 
     onVrmReady?.(vrm);
   }, [vrm, onVrmReady]);
@@ -276,29 +277,16 @@ const VrmModel: React.FC<Props> = ({ url, onVrmReady, frameRef }) => {
       }
     }
 
-
     debugFrameCount.current++;
-
-    const hb = vrm.humanoid?.humanBones;
 
     // ⚠️ 调用 vrm.update(delta)，内部处理 expressionManager + humanoid
     vrm.update(delta);
+    
 
     // ─── 方案 B：morph target 直驱 —— 必须在 vrm.update() 之后执行 ───
-    // 因为 vrm.update() 内部可能重置 morphTargetInfluences 数组
     if (frame && morphMappings.current.length > 0 && !useExpressionManager.current) {
       const { blendshapes } = frame;
-
-      // 计算衍生表情（ARkit → VRM ShapeKey 映射）
       const expressions = computeExpressions(blendshapes);
-
-      // 调试：有衍生表情时打印
-      const exprKeys = Object.keys(expressions);
-      if (exprKeys.length > 0 && debugFrameCount.current % 60 === 1) {
-        console.log('[VrmModel] 🎭 衍生表情:', Object.entries(expressions).map(([k, v]) => `${k}=${v.toFixed(2)}`));
-      }
-
-      // 合并：原始 ARkit 值 + 衍生表情值（衍生表情优先级更高，后写入覆盖）
       const allValues: Record<string, number> = { ...blendshapes, ...expressions };
 
       for (const mapping of morphMappings.current) {
@@ -308,23 +296,6 @@ const VrmModel: React.FC<Props> = ({ url, onVrmReady, frameRef }) => {
           if (idx !== undefined && idx < arr.length) {
             arr[idx] = value;
           }
-        }
-      }
-
-      // 调试：每60帧打印一次关键 morph 值
-      debugFrameCount.current++;
-      if (debugFrameCount.current % 60 === 0) {
-        const m = morphMappings.current[0];
-        if (m) {
-          const eyeIdx = m.nameToIndex.get('eyeBlinkLeft');
-          const jawIdx = m.nameToIndex.get('jawOpen');
-          const smileIdx = m.nameToIndex.get('mouthSmileLeft');
-          console.log(
-            `[VrmModel] 🔍 帧#${debugFrameCount.current} (vrm.update后)`,
-            `eyeBlinkLeft=${eyeIdx !== undefined ? m.mesh.morphTargetInfluences![eyeIdx].toFixed(3) : 'N/A'}`,
-            `jawOpen=${jawIdx !== undefined ? m.mesh.morphTargetInfluences![jawIdx].toFixed(3) : 'N/A'}`,
-            `mouthSmileLeft=${smileIdx !== undefined ? m.mesh.morphTargetInfluences![smileIdx].toFixed(3) : 'N/A'}`,
-          );
         }
       }
     }
