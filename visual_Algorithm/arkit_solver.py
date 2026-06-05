@@ -7,52 +7,215 @@ def remap(val, imin, imax, omin, omax):
     else:
         clamped = max(imax, min(imin, val))
     return omin + (clamped - imin) * (omax - omin) / (imax - imin)
-
+# 阻止了因为转头而导致的形状扭曲，就是乘以一个逆旋转矩阵
+def transform_to_local_space(lm, head_pose):
+    origin = head_pose["position"]
+    cx, cy, cz = head_pose["rad_x"], head_pose["rad_y"], head_pose["rad_z"]
+    
+    # 构造标准 3D 欧拉角旋转矩阵的逆矩阵（即角度取负）
+    Rx = np.array([[1, 0, 0], [0, np.cos(-cx), -np.sin(-cx)], [0, np.sin(-cx), np.cos(-cx)]])
+    Ry = np.array([[np.cos(-cy), 0, np.sin(-cy)], [0, 1, 0], [-np.sin(-cy), 0, np.cos(-cy)]])
+    Rz = np.array([[np.cos(-cz), -np.sin(-cz), 0], [np.sin(-cz), np.cos(-cz), 0], [0, 0, 1]])
+    
+    # 矩阵乘法组合总逆旋转矩阵 R_inv
+    R_inv = Rz @ Ry @ Rx
+    
+    local_lm = {}
+    # 这样 pt 拿到的就是干净的 [x,y,z] 坐标，而不是报错
+    for idx, pt in lm.items():
+        # 先平移让头部中心回到 (0,0,0)，再乘逆旋转矩阵拉平投影
+        local_lm[idx] = R_inv @ (np.array(pt) - origin)
+        
+    return local_lm
+# 解算出眼部的Arkit系数
 def solve_eyes(lm, eye_dist_base, eye_outer_base, head_y):
+
     eye_bs = {}
+    # 提取两眼的边界死点 (用于瞳孔追踪基准)
+    p_eye_l_inner = np.array(lm[133]) # 左内眼角
+    p_eye_l_outer = np.array(lm[130]) # 左外眼角
+    # 右眼
+    p_eye_r_inner = np.array(lm[362]) # 右内眼角
+    p_eye_r_outer = np.array(lm[263]) # 右外眼角
+
+    # 眼睑张开度解算 (垂直 3 组点对距离平均法)
+    # 左眼上下眼睑 3 组对称点
+    l_top_points = [np.array(lm[159]), np.array(lm[158]), np.array(lm[160])]
+    l_bot_points = [np.array(lm[145]), np.array(lm[153]), np.array(lm[144])]
+    # 右眼上下眼睑 3 组对称点
+    r_top_points = [np.array(lm[386]), np.array(lm[385]), np.array(lm[387])]
+    r_bot_points = [np.array(lm[374]), np.array(lm[373]), np.array(lm[380])]
+
+    # 计算 3 组垂直距离的平均值
+    l_vert_dist = sum(np.linalg.norm(t - b) for t, b in zip(l_top_points, l_bot_points)) / 3.0
+    r_vert_dist = sum(np.linalg.norm(t - b) for t, b in zip(r_top_points, r_bot_points)) / 3.0
+
+    # 归一化：除以外眼角总跨度，消除离镜头远近的干扰
+    l_open_ratio = l_vert_dist / (eye_outer_base + 1e-6)
+    r_open_ratio = r_vert_dist / (eye_outer_base + 1e-6)
+
+    # 【工程硬核痛点修复】：大角度转头透视补偿
+    # 当头转动时，眼睛由于视线倾斜投影变窄，比值会变小。乘以 1/cos(head_y) 把它拉回真实物理高度。
+    turn_compensation = 1.0 / (np.cos(head_y) + 1e-3)
+    l_open_ratio *= turn_compensation
+    r_open_ratio *= turn_compensation
+
+    # 映射到标准 ARKit Blendshapes 权重
+    # 正常睁眼 ratio 在 0.18 ~ 0.28 左右，低于 0.13 判定为闭眼，高于 0.29 判定为瞪眼
+    eye_bs["eyeBlinkLeft"]  = remap(l_open_ratio, 0.24, 0.12, 0.0, 1.0)
+    eye_bs["eyeBlinkRight"] = remap(r_open_ratio, 0.24, 0.12, 0.0, 1.0)
     
-    # 这里放 Kalidokit 的 3组点对平均逻辑 (get_eye_lid_ratio)
-    # 计算出：eyeBlinkLeft, eyeBlinkRight, eyeWideLeft, eyeWideRight, eyeSquintLeft...
-    # 以及解算瞳孔：eyeLookInLeft, eyeLookOutLeft, eyeLookUpLeft...
+    eye_bs["eyeWideLeft"]   = remap(l_open_ratio, 0.26, 0.35, 0.0, 1.0)
+    eye_bs["eyeWideRight"]  = remap(r_open_ratio, 0.26, 0.35, 0.0, 1.0)
     
-    # 示例一行：
-    # eye_bs["eyeBlinkLeft"] = 1.0 - left_open
+    # Squint (眯眼) 逻辑：当微眯但没完全闭上时触发
+    eye_bs["eyeSquintLeft"]  = remap(l_open_ratio, 0.20, 0.14, 0.0, 1.0) if eye_bs["eyeBlinkLeft"] < 0.7 else 0.0
+    eye_bs["eyeSquintRight"] = remap(r_open_ratio, 0.20, 0.14, 0.0, 1.0) if eye_bs["eyeBlinkRight"] < 0.7 else 0.0
+
+    # 瞳孔精细解算 (Pupil Tracking)
+    # 提取高精度瞳孔中心 3D 点
+    p_pupil_l = np.array(lm[468]) # 左瞳孔中心
+    p_pupil_r = np.array(lm[473]) # 右瞳孔中心
+
+    # 计算瞳孔中心到内眼角的距离，占“内眼角到外眼角总跨度”的百分比
+    l_eye_width = np.linalg.norm(p_eye_l_outer - p_eye_l_inner) + 1e-6
+    r_eye_width = np.linalg.norm(p_eye_r_outer - p_eye_r_inner) + 1e-6
+
+    l_pupil_x_ratio = np.linalg.norm(p_pupil_l - p_eye_l_inner) / l_eye_width
+    r_pupil_x_ratio = np.linalg.norm(p_pupil_r - p_eye_r_inner) / r_eye_width
+
+    # 判定看左看右：正常直视时 ratio 约为 0.5
+    # 左眼（LookIn 是向右看鼻梁，LookOut 是向左看外侧）
+    eye_bs["eyeLookInLeft"]   = remap(l_pupil_x_ratio, 0.52, 0.35, 0.0, 1.0) # 偏向内眼角
+    eye_bs["eyeLookOutLeft"]  = remap(l_pupil_x_ratio, 0.48, 0.65, 0.0, 1.0) # 偏向外眼角
+    
+    # 右眼（LookIn 是向左看鼻梁，LookOut 是向右看外侧）
+    eye_bs["eyeLookInRight"]  = remap(r_pupil_x_ratio, 0.48, 0.65, 0.0, 1.0) # 偏向内眼角
+    eye_bs["eyeLookOutRight"] = remap(r_pupil_x_ratio, 0.52, 0.35, 0.0, 1.0) # 偏向外眼角
+
+    # --- 上下看 (LookUp / LookDown) 解算 ---
+    # 计算瞳孔中心点偏离眼角水平线段的垂直绝对距离
+    l_line_center = (p_eye_l_inner + p_eye_l_outer) * 0.5
+    r_line_center = (p_eye_r_inner + p_eye_r_outer) * 0.5
+
+    # 提取垂直方向(Y轴)位移。由于 MediaPipe Y 轴向下，所以用 (中心 - 瞳孔) 算向上
+    l_pupil_y_offset = (l_line_center[1] - p_pupil_l[1]) / (eye_dist_base + 1e-6)
+    r_pupil_y_offset = (r_line_center[1] - p_pupil_r[1]) / (eye_dist_base + 1e-6)
+
+    eye_bs["eyeLookUpLeft"]    = remap(l_pupil_y_offset, 0.01, 0.06, 0.0, 1.0)
+    eye_bs["eyeLookDownLeft"]  = remap(l_pupil_y_offset, -0.01, -0.06, 0.0, 1.0)
+    
+    eye_bs["eyeLookUpRight"]   = remap(r_pupil_y_offset, 0.01, 0.06, 0.0, 1.0)
+    eye_bs["eyeLookDownRight"] = remap(r_pupil_y_offset, -0.01, -0.06, 0.0, 1.0)
+
     return eye_bs
 
 
 def solve_brows(lm, eye_dist_base):
+
     brow_bs = {}
     
-    # 这里放眉毛抬起、下压、挑眉的几何解算
-    # 计算出：browInnerUp, browDownLeft, browDownRight, browOuterUpLeft, browOuterUpRight
+    # 基础基准点
+    p_nose_bridge = np.array(lm[6]) # 鼻梁中点作为高度不动点
+    
+    # 左眉毛核心点：内侧(65), 中间(52), 外侧(70)
+    # 右眉毛核心点：内侧(295), 中间(282), 外侧(300)
+    
+    # 计算眉毛内侧抬起 (browInnerUp) —— 左右眼眉内侧距离鼻梁的垂直距离
+    l_inner_dist = np.array(lm[65])[1] - p_nose_bridge[1]
+    r_inner_dist = np.array(lm[295])[1] - p_nose_bridge[1]
+    # 转换号（MediaPipe Y轴向下，减出来负得越多代表抬得越高）
+    brow_inner_up = (-l_inner_dist - r_inner_dist) * 0.5 / eye_dist_base
+    brow_bs["browInnerUp"] = remap(brow_inner_up, 0.22, 0.38, 0.0, 1.0)
+    
+    # 计算下压眉 (browDownLeft / browDownRight) —— 眉头压低
+    brow_bs["browDownLeft"]  = remap(-l_inner_dist / eye_dist_base, 0.22, 0.15, 0.0, 1.0)
+    brow_bs["browDownRight"] = remap(-r_inner_dist / eye_dist_base, 0.22, 0.15, 0.0, 1.0)
+    
+    # 计算挑眉/外侧抬起 (browOuterUpLeft / browOuterUpRight)
+    l_outer_dist = - (np.array(lm[70])[1] - p_nose_bridge[1]) / eye_dist_base
+    r_outer_dist = - (np.array(lm[300])[1] - p_nose_bridge[1]) / eye_dist_base
+    
+    brow_bs["browOuterUpLeft"]  = remap(l_outer_dist, 0.25, 0.42, 0.0, 1.0)
+    brow_bs["browOuterUpRight"] = remap(r_outer_dist, 0.25, 0.42, 0.0, 1.0)
     
     return brow_bs
 
 
 def solve_nose_and_cheeks(lm, eye_dist_base):
+
     nc_bs = {}
     
-    # 计算出：noseSneerLeft, noseSneerRight, cheekPuff, cheekSquintLeft, cheekSquintRight
+    # 鼻梁基准点
+    p_nose_bridge = np.array(lm[6])
+    # 内眼角基准
+    p_eye_l_inner = np.array(lm[133])
+    p_eye_r_inner = np.array(lm[362])
+    
+    # 鼻翼点
+    p_sneer_l = np.array(lm[129])
+    p_sneer_r = np.array(lm[358])
+    
+    # 计算内眼角到鼻翼的Y轴距离（正常约 0.08-0.12，皱鼻子时缩小到 0.05-0.08）
+    l_sneer = abs(p_eye_l_inner[1] - p_sneer_l[1]) / eye_dist_base
+    r_sneer = abs(p_eye_r_inner[1] - p_sneer_r[1]) / eye_dist_base
+    
+    # 距离变小 = 皱鼻越厉害
+    nc_bs["noseSneerLeft"]  = remap(l_sneer, 0.10, 0.06, 0.0, 1.0)
+    nc_bs["noseSneerRight"] = remap(r_sneer, 0.10, 0.06, 0.0, 1.0)
+    
+    # 鼓包/笑肌抬起 (cheekSquintLeft / cheekSquintRight)
+    # 提取眼睛下方笑肌控制点：左(50), 右(280) 到眼眶下沿的距离
+    l_cheek = (np.array(lm[50])[1] - np.array(lm[145])[1]) / eye_dist_base
+    r_cheek = (np.array(lm[280])[1] - np.array(lm[374])[1]) / eye_dist_base
+    
+    nc_bs["cheekSquintLeft"]  = remap(l_cheek, 0.22, 0.12, 0.0, 1.0)
+    nc_bs["cheekSquintRight"] = remap(r_cheek, 0.22, 0.12, 0.0, 1.0)
+    
+    # 鼓嘴保底占位 (cheekPuff)
+    nc_bs["cheekPuff"] = 0.0 
     
     return nc_bs
 
 def solve_mouth_and_jaw(lm, eye_dist_base, eye_outer_base):
+   
     mouth_bs = {}
     
-    # 基础张开
+    #  基础下巴张开与歪斜
     ratio = np.linalg.norm(np.array(lm[13]) - np.array(lm[14])) / eye_dist_base
     mouth_bs["jawOpen"] = remap(ratio, 0.15, 0.85, 0.0, 1.0)
     
-    # 防穿模闭嘴
     lip_dist = np.linalg.norm(np.array(lm[13]) - np.array(lm[14])) / eye_dist_base
     mouth_bs["mouthClose"] = remap(lip_dist, 0.2, 0.05, 0.0, 1.0) if mouth_bs["jawOpen"] > 0.1 else 0.0
     
-    # 下巴歪斜与前伸
     jaw_x_offset = (lm[152][0] - lm[6][0]) / eye_dist_base
     mouth_bs["jawLeft"] = remap(jaw_x_offset, 0.0, 0.12, 0.0, 1.0)
     mouth_bs["jawRight"] = remap(jaw_x_offset, -0.12, 0.0, 1.0, 0.0)
     
-    
+    # 精细嘴型与嘴角弧度控制
+    p_mouth_l = np.array(lm[61])    # 左嘴角
+    p_mouth_r = np.array(lm[291])   # 右嘴角
+    p_lip_top = np.array(lm[0])     # 上唇中心
+    p_lip_bot = np.array(lm[17])    # 下唇中心
+    p_mouth_center = (p_lip_top + p_lip_bot) * 0.5
+
+    # 嘴角横向总宽度
+    mouth_width = np.linalg.norm(p_mouth_l - p_mouth_r) / eye_dist_base
+
+    # 微笑(Smile)与撇嘴悲伤(Frown) —— 观察嘴角点相对于嘴唇中心线 Y 轴的上下位移
+    l_corner_y = p_mouth_center[1] - p_mouth_l[1] # 值为正代表嘴角上扬
+    r_corner_y = p_mouth_center[1] - p_mouth_r[1]
+
+    mouth_bs["mouthSmileLeft"]  = remap(l_corner_y / eye_dist_base, 0.02, 0.15, 0.0, 1.0)
+    mouth_bs["mouthSmileRight"] = remap(r_corner_y / eye_dist_base, 0.02, 0.15, 0.0, 1.0)
+    mouth_bs["mouthFrownLeft"]  = remap(l_corner_y / eye_dist_base, -0.01, -0.12, 0.0, 1.0)
+    mouth_bs["mouthFrownRight"] = remap(r_corner_y / eye_dist_base, -0.01, -0.12, 0.0, 1.0)
+
+    # 撅嘴(Pucker) 与 O 动作(Funnel) —— 基于嘴角向内合拢的物理宽度收缩
+    # 正常平铺下嘴宽比值约 0.85 左右，低于 0.65 意味着嘴唇向内缩成圆形
+    mouth_bs["mouthPucker"] = remap(mouth_width, 0.82, 0.58, 0.0, 1.0)
+    mouth_bs["mouthFunnel"] = remap(mouth_width, 0.82, 0.62, 0.0, 1.0) if mouth_bs["jawOpen"] > 0.15 else 0.0
+
     return mouth_bs
 
 def solve_head_rotation(lm):
@@ -86,11 +249,7 @@ def solve_head_rotation(lm):
     # 重新修正一个用于算 Roll 的水平基准线倾斜度
     v1_norm = v1 / (np.linalg.norm(v1) + 1e-6)
     rotate_z = np.arctan2(v1_norm[1], v1_norm[0]) / np.pi # Roll
-    
-    # 1:1 坐标系镜像反转
-    # 原版源码：rotate.x *= -1; rotate.z *= -1;
-    rotate_x *= -1
-    rotate_z *= -1
+
     
     # 换算成弧度值 (Radians)与角度制 (Degrees)
     rad_x = rotate_x * np.pi
@@ -121,32 +280,38 @@ def solve_head_rotation(lm):
 
 def calc_all_arkit_coefficients(smooth_mesh_mock):
     lm = smooth_mesh_mock
-    
-    # 边界安全检查：如果 MediaPipe 弄丢了人脸，吐出全0，直接返回空的或全0默认值
     if len(lm) == 0 or np.all(np.array(lm[6]) == 0):
-        # 返回 52 个全 0 的标准 ARKit 字典保底，防止下游渲染崩掉
-        return {k: 0.0 for k in ["jawOpen", "eyeBlinkLeft", "mouthSmileLeft"]} # 示例
-        
+       # 兜底保障返回，防止下游空值报错崩溃
+        return {k: 0.0 for k in ["jawOpen", "eyeBlinkLeft", "mouthSmileLeft"]}   
     computed_bs = {}
     
-    # 动捕必须先知道转头角度，因为后面眼睛防抽搐稳定器需要用到 head_y
+    #优先提取全局头部的 3D 刚性旋转姿态数据
     head_pose = solve_head_rotation(lm)
     head_y = head_pose["rad_y"]
     
-    # 3. 计算全局刚性归一化基准（消减离镜头远近的误差）
-    eyeInnerDistance = np.linalg.norm(np.array(lm[133]) - np.array(lm[362]))
-    if eyeInnerDistance == 0: eyeInnerDistance = 0.001 # 再次保底
+    # 在这里生成完全剥离了旋转形变的“绝对正脸 3D 点阵”
+    local_lm = transform_to_local_space(lm, head_pose)
     
-    eyeOuterDistance = np.linalg.norm(np.array(lm[130]) - np.array(lm[263]))
+    # 计算全局刚性归一化基准（在无形变的局部空间计算，绝对精确）
+    eyeInnerDistance = np.linalg.norm(np.array(local_lm[133]) - np.array(local_lm[362]))
+    if eyeInnerDistance == 0: eyeInnerDistance = 0.001 
+    
+    eyeOuterDistance = np.linalg.norm(np.array(local_lm[130]) - np.array(local_lm[263]))
     if eyeOuterDistance == 0: eyeOuterDistance = 0.001
 
-    computed_bs.update(solve_eyes(lm, eyeInnerDistance, eyeOuterDistance, head_y))
-    computed_bs.update(solve_brows(lm, eyeInnerDistance))
-    computed_bs.update(solve_nose_and_cheeks(lm, eyeInnerDistance))
-    computed_bs.update(solve_mouth_and_jaw(lm, eyeInnerDistance, eyeOuterDistance))
+    #将所有表情解算器全部升级为接收 local_lm 局部空间点阵
+    computed_bs.update(solve_eyes(local_lm, eyeInnerDistance, eyeOuterDistance, head_y))
+    computed_bs.update(solve_brows(local_lm, eyeInnerDistance))
+    computed_bs.update(solve_nose_and_cheeks(local_lm, eyeInnerDistance))
+    computed_bs.update(solve_mouth_and_jaw(local_lm, eyeInnerDistance, eyeOuterDistance))
 
-    # 5. 统一进行最终的边界限幅安全检查 (0.0 到 1.0 之间)
+    # 5. 统一进行边界安全限制 [0.0, 1.0]
     for k, v in computed_bs.items():
         computed_bs[k] = max(0.0, min(1.0, v))
+
+    # 6. 将解算好的头部欧拉角（角度制）一并注入输出，用于同步驱动虚拟主播的转头
+    computed_bs["_head_deg_x"] = head_pose["x"]
+    computed_bs["_head_deg_y"] = head_pose["y"]
+    computed_bs["_head_deg_z"] = head_pose["z"]
 
     return computed_bs

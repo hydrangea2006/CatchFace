@@ -1,6 +1,7 @@
 import numpy as np
 from oefilter import oefilter 
 import time
+import arkit_solver
 class land_mark_transformer:
 #   # L/R 结尾代表左右。
     # INNER/OUTER 代表内外侧。
@@ -123,18 +124,8 @@ class land_mark_transformer:
         }
     }
     def __init__(self, mincutoff=1.2, beta=0.005, dcutoff=1.0):
-        # 1. 提取所有要用到的不重复索引
-        all_indices = set()
-        all_indices.update(self.FACE_POINTS["eye"].values())
-        all_indices.update(self.FACE_POINTS["brow"].values())
-        all_indices.update(self.FACE_POINTS["pupil"].values())
-        all_indices.update(self.FACE_POINTS["head_rigid"].values())
-        all_indices.update(self.FACE_POINTS["mouth"].values())
-        all_indices.update(self.FACE_POINTS["jaw"].values())
-        all_indices.update(self.FACE_POINTS["cheek"].values())
-        all_indices.update(self.FACE_POINTS["nose"].values())
-
-        self.needed_indices = sorted(list(all_indices))
+        # 直接用全部478个点，省得各种KeyError
+        self.needed_indices = list(range(478))
         
         #  一个点只需要一个 oefilter 实例
         self.filters = {}
@@ -177,3 +168,97 @@ class land_mark_transformer:
             smooth_mesh_mock[idx] = [smooth_x, smooth_y, smooth_z]
             
         return smooth_mesh_mock
+
+    def get_arkit_blendshapes_response(self, raw_face_landmarks):
+
+        # 1. 滤波清洗
+        smooth_mesh = self.get_smooth_mesh(raw_face_landmarks)
+        
+        if len(smooth_mesh) == 0:
+            return {
+                "timestamp": int(time.time() * 1000),
+                "head": {"rotation": {"x": 0.0, "y": 0.0, "z": 0.0}, "position": [0.0, 0.0, 0.0]},
+                "blendshapes": {}
+            }
+            
+        #直接调用 arkit_solver 原本就有的头部姿态函数
+        # 它返回的字典包含: "rad_x", "rad_y", "rad_z", "position" (np.array)
+        head_pose = arkit_solver.solve_head_rotation(smooth_mesh)
+        
+        # 3. 直接调用 arkit_solver 原本的核心解算函数，拿到基础系数字典
+        raw_bs = arkit_solver.calc_all_arkit_coefficients(smooth_mesh)
+
+        # 4. 提取绝对物理中心位置 (p1, p2, p3, p4 质心)，转换为 list
+        # 这样 arkit_solver 内部甚至连 solve_head_rotation 都不用改动
+        p1 = np.array(smooth_mesh[21])   
+        p2 = np.array(smooth_mesh[251])  
+        p3 = np.array(smooth_mesh[397])  
+        p4 = np.array(smooth_mesh[172])  
+        head_position = ((p1 + p2 + p3 + p4) * 0.25).tolist()
+
+        # 特殊处理：解算器原本的嘴部拉伸叫 "mouthPucker" 或 "mouthFunnel"，
+        # 模板中需要 "mouthStretch"，我们在这里取解算器里算好的数值做映射
+        # 也可以直接用 mouthPucker 的趋势来当做 Stretch 使用（或者给默认值）
+        mouth_stretch_val = raw_bs.get("mouthPucker", 0.0) 
+
+        #完美拼装前端需要的 52 通道大字典
+        arkit_blendshapes = {
+            "eyeBlinkLeft":     float(raw_bs.get("eyeBlinkLeft", 0.0)),
+            "eyeBlinkRight":    float(raw_bs.get("eyeBlinkRight", 0.0)),
+            "eyeLookDownLeft":  0.0,     "eyeLookDownRight": 0.0,
+            "eyeLookInLeft":    float(raw_bs.get("eyeLookInLeft", 0.0)),
+            "eyeLookInRight":   float(raw_bs.get("eyeLookInRight", 0.0)),
+            "eyeLookOutLeft":   float(raw_bs.get("eyeLookOutLeft", 0.0)),
+            "eyeLookOutRight":  float(raw_bs.get("eyeLookOutRight", 0.0)),
+            "eyeLookUpLeft":    float(raw_bs.get("eyeLookUpLeft", 0.0)),
+            "eyeLookUpRight":   float(raw_bs.get("eyeLookUpRight", 0.0)),
+            "eyeSquintLeft":    float(raw_bs.get("eyeSquintLeft", 0.0)),
+            "eyeSquintRight":   float(raw_bs.get("eyeSquintRight", 0.0)),
+            "eyeWideLeft":      float(raw_bs.get("eyeWideLeft", 0.0)),
+            "eyeWideRight":     float(raw_bs.get("eyeWideRight", 0.0)),
+            "browDownLeft":     float(raw_bs.get("browDownLeft", 0.0)),
+            "browDownRight":    float(raw_bs.get("browDownRight", 0.0)),
+            "browInnerUp":      float(raw_bs.get("browInnerUp", 0.0)),
+            "browOuterUpLeft":  float(raw_bs.get("browOuterUpLeft", 0.0)),
+            "browOuterUpRight": float(raw_bs.get("browOuterUpRight", 0.0)),
+            "jawOpen":          float(raw_bs.get("jawOpen", 0.0)),
+            "jawForward":       0.0,
+            "jawLeft":          float(raw_bs.get("jawLeft", 0.0)),
+            "jawRight":         float(raw_bs.get("jawRight", 0.0)),
+            "mouthClose":       float(raw_bs.get("mouthClose", 0.0)),
+            "mouthFunnel":      float(raw_bs.get("mouthFunnel", 0.0)),
+            "mouthPucker":      float(raw_bs.get("mouthPucker", 0.0)),
+            "mouthLeft":        0.0,        "mouthRight":       0.0,
+            "mouthSmileLeft":   float(raw_bs.get("mouthSmileLeft", 0.0)),
+            "mouthSmileRight":  float(raw_bs.get("mouthSmileRight", 0.0)),
+            "mouthFrownLeft":   float(raw_bs.get("mouthFrownLeft", 0.0)),
+            "mouthFrownRight":  float(raw_bs.get("mouthFrownRight", 0.0)),
+            "mouthStretchLeft": float(mouth_stretch_val),
+            "mouthStretchRight":float(mouth_stretch_val),
+            "mouthDimpleLeft":  0.0,        "mouthDimpleRight": 0.0,
+            "mouthPressLeft":   0.0,        "mouthPressRight":  0.0,
+            "mouthRollLower":   0.0,        "mouthRollUpper":   0.0,
+            "mouthShrugLower":  0.0,        "mouthShrugUpper":  0.0,
+            "mouthUpperUpLeft": 0.0,        "mouthUpperUpRight":0.0,
+            "mouthLowerDownLeft":0.0,       "mouthLowerDownRight":0.0,
+            "cheekPuff":        0.0,
+            "cheekSquintLeft":  float(raw_bs.get("cheekSquintLeft", 0.0)),
+            "cheekSquintRight": float(raw_bs.get("cheekSquintRight", 0.0)),
+            "noseSneerLeft":    float(raw_bs.get("noseSneerLeft", 0.0)),
+            "noseSneerRight":   float(raw_bs.get("noseSneerRight", 0.0)),
+            "tongueOut":        0.0
+        }
+
+        # 完美交差返回
+        return {
+            "timestamp": int(time.time() * 1000),
+            "head": {
+                "rotation": {
+                    "x": float(head_pose["rad_x"]), 
+                    "y": float(head_pose["rad_y"]), 
+                    "z": float(head_pose["rad_z"])
+                },
+                "position": head_position
+            },
+            "blendshapes": arkit_blendshapes
+        }

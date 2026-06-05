@@ -4,6 +4,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import time
 from ldtransformer import land_mark_transformer
+
 class FaceCatcher:
     def __init__(self):
         # 1. 配置 MediaPipe 的人工智能模型参数
@@ -12,15 +13,13 @@ class FaceCatcher:
             base_options = base_options,
             output_face_blendshapes = False,
             output_facial_transformation_matrixes = False,
-            refine_face_landmarks = True,
             running_mode = vision.RunningMode.LIVE_STREAM,  # 开启异步直播流模式
-            result_callback = self.result_callback,         # 指定计算完后的“交货”回调函数
+            result_callback = self.result_callback,         # 指定计算完后的"交货"回调函数
             num_faces = 1
         )
         
-        # 2. 实例化一个一欧元滤波器，用来专门给鼻尖（4号点）去噪防抖
-        
-        
+        # 2. 实例化你的 land_mark_transformer（一欧元滤波 + ARKit 解算）
+        self.ld_transformer = land_mark_transformer(mincutoff=1.2, beta=0.005, dcutoff=1.0)
 
     def start_stream(self):
         # 创建面部关键点检测器
@@ -28,14 +27,13 @@ class FaceCatcher:
         # 打开电脑的默认摄像头（0代表第一个摄像头）
         self.cap = cv2.VideoCapture(0)
         
-    
         try:
             while self.cap.isOpened():
                 success, image = self.cap.read()
                 if not success:
                     print("无法从摄像头获取画面...")
                     continue
-                    
+                image = cv2.flip(image, 1)
                 # MediaPipe 需要 RGB 格式，而 OpenCV 默认读出的是 BGR 格式，所以需要转换
                 rbg_img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 # 将转换后的图像包装成 MediaPipe 专属的 Image 对象
@@ -67,6 +65,16 @@ class FaceCatcher:
         # 1. 拿到检测到的第一张脸的 478 个原始关键点
         raw_face_points = result.face_landmarks[0]
         
+        # 2. 直接调用你的 land_mark_transformer，一站式拿到滤波+解算后的完整 ARKit 数据
+        arkit_response = self.ld_transformer.get_arkit_blendshapes_response(raw_face_points)
+        
+        # 3. 现在 arkit_response 就是你要的完整字典，包含：
+        #    - arkit_response["timestamp"]    # 时间戳
+        #    - arkit_response["head"]         # 头部旋转 + 位置
+        #    - arkit_response["blendshapes"]  # 52 个 blendshape 系数
+        
+        print(arkit_response)  # 或者你可以在这里做任何你想做的事
+
 if __name__ == "__main__":
     catcher = FaceCatcher()
     catcher.start_stream()
