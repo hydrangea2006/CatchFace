@@ -1,6 +1,7 @@
 from flask import Flask, request
 from flask_socketio import SocketIO, emit
 import logging
+import time
 from datetime import datetime
 
 
@@ -16,7 +17,7 @@ socketio = SocketIO(app,
                    cors_allowed_origins="*",
                    logger=True, 
                    engineio_logger=True,
-                   async_mode='threading')
+                   async_mode='gevent')
 
 
 # ========== Socket 事件处理 ==========
@@ -65,7 +66,7 @@ def handle_blendshapes(data):
         }
         
         # 广播给所有连接的客户端（包括发送者）
-        emit('face_update', broadcast_data, broadcast=True)
+        emit('face_data', broadcast_data, broadcast=True)
         
         # 可选：打印日志（每10帧打印一次避免刷屏，这里简单打印）
         # logger.info(f'[广播] 表情数据已广播 - 帧时间戳: {timestamp}')
