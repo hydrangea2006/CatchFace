@@ -215,7 +215,6 @@ def solve_nose_and_cheeks(lm, eye_dist_base):
     )
     puff_ratio = cheek_width / (eye_dist_base + 1e-6)
 
-    print(f"puff_ratio={puff_ratio:.4f}", end=" | ")
 
     nc_bs["cheekPuff"] = remap(puff_ratio, 2.35, 2.50, 0.0, 1.0)    
     return nc_bs

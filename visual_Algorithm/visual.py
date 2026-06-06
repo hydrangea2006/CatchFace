@@ -4,6 +4,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import time
 from ldtransformer import land_mark_transformer
+from network_sender import FaceNetSender
 
 class FaceCatcher:
     def __init__(self):
@@ -20,6 +21,10 @@ class FaceCatcher:
         
         # 2. 实例化你的 land_mark_transformer（一欧元滤波 + ARKit 解算）
         self.ld_transformer = land_mark_transformer(mincutoff=1.2, beta=0.005, dcutoff=1.0)
+
+        # 网络发送实例初始化
+        self.net_sender = FaceNetSender(server_ip="127.0.0.1", port=5000, limit_fps=60)
+        self.net_sender.connect()
 
     def start_stream(self):
         # 创建面部关键点检测器
@@ -54,6 +59,9 @@ class FaceCatcher:
             # 无论如何，最后都要释放摄像头并关闭 AI 实例，否则后台线程会卡死
             self.cap.release()
             self.face_landmarker.close()
+
+            # 释放网络连接
+            self.net_sender.release()
             print("程序已安全关闭。")
 
     # 核心数据处理工厂（回调函数）：只要 AI 识别出一帧结果，就会自动进到这里
@@ -73,7 +81,8 @@ class FaceCatcher:
         #    - arkit_response["head"]         # 头部旋转 + 位置
         #    - arkit_response["blendshapes"]  # 52 个 blendshape 系数
         
-        print(arkit_response)  # 或者你可以在这里做任何你想做的事
+        # 网络发送数据
+        self.net_sender.send_face_pack(arkit_response)
 
 if __name__ == "__main__":
     catcher = FaceCatcher()
