@@ -24,7 +24,7 @@ FRONTEND_PATH = os.path.join(PROJECT_ROOT, "frontend")
 AUTO_OPEN_BROWSER = True
 
 # 启动顺序和延迟（秒）
-DELAY_BEFORE_ALGORITHM = 3   # 服务器启动后等待3秒再启动算法端
+DELAY_BEFORE_ALGORITHM = 5   # 服务器启动后等待5秒再启动算法端
 DELAY_BEFORE_FRONTEND = 5    # 算法端启动后等待5秒再启动前端
 
 # ========== 颜色输出 ==========

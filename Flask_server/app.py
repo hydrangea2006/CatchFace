@@ -15,9 +15,11 @@ app.config['SECRET_KEY'] = '123456'
 # 启用 CORS 允许局域网访问
 socketio = SocketIO(app, 
                    cors_allowed_origins="*",
-                   logger=True, 
-                   engineio_logger=True,
-                   async_mode='gevent')
+                   logger=False,               # 减少日志噪音
+                   engineio_logger=False,
+                   async_mode='gevent',
+                   ping_timeout=10,            # 心跳超时 10 秒
+                   ping_interval=5)            # 每 5 秒发一次心跳
 
 
 # ========== Socket 事件处理 ==========
@@ -132,4 +134,6 @@ if __name__ == '__main__':
     print("="*60)
     print("\n等待客户端连接...\n")
     
-    socketio.run(app, host=HOST, port=PORT, debug=True)
+    # debug=False 避免 reloader 双进程导致 WebSocket 连接混乱
+    # use_reloader=False 明确禁用重载器
+    socketio.run(app, host=HOST, port=PORT, debug=False, use_reloader=False)

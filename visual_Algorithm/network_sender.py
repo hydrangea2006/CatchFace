@@ -3,7 +3,12 @@ import time
 
 class FaceNetSender:
     def __init__(self, server_ip="127.0.0.1", port=5000, limit_fps=60):
-        self.sio = socketio.Client()
+        self.sio = socketio.Client(
+            reconnection=True,
+            reconnection_attempts=0,      # 0 = 无限重试
+            reconnection_delay=1,
+            reconnection_delay_max=5,
+        )
         self.url = f"http://{server_ip}:{port}"
         self.is_connect = False
         self.min_interval = 1.0 / limit_fps
@@ -28,7 +33,7 @@ class FaceNetSender:
             self.sio.connect(self.url, transports=["websocket"])
             return True
         except Exception as e:
-            print("[连接失败]", e)
+            print("[连接失败]", e, "- 将自动重试")
             return False
 
     def send_face_pack(self, arkit_dict):
